@@ -29,6 +29,9 @@ OBD2 and especially kw1281 https://www.blafusel.de/obd/obd.html
 #include "EncButton.h"
 #include "VAGFISWriter.h"
 
+#include <avr/sleep.h>
+#include <avr/power.h>
+
 // Пины для подключения
 #define pinButton 2
 #define pinKLineTX 3
@@ -59,7 +62,12 @@ int ErrorArray[10]; // Массив для хранения ошибок
 NewSoftwareSerial obd(pinKLineRX, pinKLineTX, false); // Инициализация программного UART для OBD (RX, TX, инверсная логика)
 bool readErrorflag = 0; // Флаг для индикации ошибки чтения
 int errorErrorCount = 1;  // Счетчик ошибок
-bool logoDash = 0;  // Флаг для отображения логотипа на приборной панели
+
+
+int currentMenu = 0;
+bool inSubMenu = false;
+int currentMenuSelection = 0; // Переменная для отслеживания текущего пункта меню
+
 
 uint8_t currAddr = 0; // Текущий адрес устройства
 uint8_t blockCounter = 0;  // Счетчик блоков данных
@@ -69,6 +77,7 @@ bool connected = false;  // Флаг соединения
 int sensorCounter = 0;  // Счетчик сенсоров
 int pageUpdateCounter = 0;  // Счетчик обновлений страницы
 int alarmCounter = 0;  // Счетчик тревог
+bool fullDash = true; // Основной экран должен запускаться первым
 bool fullDash = false;  // Флаг для полного отображения приборной панели
 uint8_t currPage = 1;  // Текущая страница
 uint8_t currPageOld;  // Предыдущая страница
@@ -767,6 +776,29 @@ void btnInterrupt() {
   btnUp.tickISR(); // Вызываем функцию обработки нажатия кнопки
 }
 
+// Функция для рисования интерфейса главного меню
+void drawMainMenu(int currentSelection) {
+    fisWriter.initFullScreen();
+    fisWriter.sendStringFS(0, 0, 0x21, "MAIN MENU");
+
+    String menuItems[] = {"SUMMARY", "READ ERROR", "ABOUT", "EXIT", "UFIS OFF"};
+
+    for (int i = 0; i < 5; i++) {
+        int yPos = 16 + (i * 10); // Позиция для каждого пункта
+        
+        if (i == currentSelection) {
+            // Отображаем выбранный пункт с выделением
+            fisWriter.sendMsgFS(0, yPos, 0x20, menuItems[i].length(), menuItems[i].c_str());
+        } else {
+            // Отображаем обычный текст для остальных пунктов
+            fisWriter.sendStringFS(0, yPos, 0x21, menuItems[i]);
+        }
+    }
+}
+
+
+
+
 // Настройка начальных параметров
 void setup()
 {
@@ -786,106 +818,100 @@ void setup()
 
 // Основной цикл программы
 void loop() {
-	
-	delay(500); // Задержка в 100 мс перед проверкой welcomeScreenShown
-	// Показать приветственный экран, если он еще не был показан
+    delay(500); 
+
+    // Display welcome screen once
     if (!welcomeScreenShown) {
-        fisWriter.initFullScreen(); // Инициализация полноэкранного режима
-        fisWriter.sendStringFS(0, 5 * 8, 0x21, F("WELCOME")); // Отправка строки "WELCOME" на экран
-        delay(2000); // Задержка на 2 секунды
-
         fisWriter.initFullScreen();
-        fisWriter.GraphicFromArray(0, 0, 64, 88, vwlogo, 2); // Отображение логотипа
+        fisWriter.sendStringFS(0, 5 * 8, 0x21, F("WELCOME"));
         delay(2000);
-        fisWriter.reset(); // Сброс fisWriter
+        fisWriter.initFullScreen();
+        fisWriter.GraphicFromArray(0, 0, 64, 88, vwlogo, 2);
+        delay(2000);
+        fisWriter.reset();
+        welcomeScreenShown = true;
+    }
+
+    btnUp.tick(); // Update button state
+
+    // Handle button hold
+    if (btnUp.held()) {
+        if (currPage == 10) {
+            clearErrors(); // Clear errors for specific page
+        } else {
+            fullDash = !fullDash; // Toggle display mode
+            countLoop = 1;
+            fisWriter.reset();
+        }
+    }
+
+    // Навигация по главному меню и меню
+    if (!fullDash) {
+			drawMainMenu(currentMenuSelection); // Update the displayed menu
 		
-		welcomeScreenShown = true; // Устанавливаем флаг, что приветственный экран был показан
-  }
-  
-  btnUp.tick(); // Обновление состояния кнопки
+        if (btnUp.hasClicks(1)) {
+            currPage++;
+            if (currPage > 8) currPage = 1;
+            eeprom_update_byte(0, currPage);
+			
+			currentMenuSelection++;
+            if (currentMenuSelection >= 5) // Предполагаем 5 пунктов меню
+            currentMenuSelection = 0;
+        }
 
-  // Обработка удержания кнопки
-  if (btnUp.held())
-  {
-    if(currPage==10){
-      clearErrors(); // Если текущая страница 10, очищаем ошибки (для функции чтение ошибок ЕБУ)
-    } else {
-      fullDash = !fullDash; // Переключаем режим отображения (полная панель/частичная)
-      countLoop = 1; // Обнуляем счетчик цикла
-      fisWriter.reset();
-      !readErrorflag; // Закомментированная логика для обработки ошибок, неопределено
-    }
-  }
+        if (btnUp.hasClicks(2)) {
+            currPage--;
+            if (currPage < 1) currPage = 8;
+            eeprom_update_byte(0, currPage);
+        }
 
- // Если полная панель не включена
-  if (!fullDash) {
-	  
-	// Проверка на одно нажатие кнопки
-    if (btnUp.hasClicks(1)) // Одно нажатие - следующая страница
-    {
-      currPage++; // Увеличиваем номер текущей страницы
-      if (currPage > 8) // Если текущая страница больше 8, возврат к 1-й
-        currPage = 1; // Сбрасываем на первую страницу
-        !readErrorflag;
-      eeprom_update_byte(0, currPage); // Сохраняем текущую страницу в EEPROM, всегда будет та страница на которой вы остановились
-    }
+        // Page actions based on `currPage`
+        switch (currPage) {
+            case 1:
+                getECUSensor(5);
+                fisWriter.sendString("SPEED", String(vehicleSpeed) + " km/h");
+                break;
+            case 2:
+                getECUSensor(4);
+                fisWriter.sendString("COOLANT", String(coolantTemp) + "C");
+                break;
+            case 3:
+                getECUSensor(4);
+                fisWriter.sendString("VOLTAGE", String(supplyVoltage) + "V");
+                break;
+            case 4:
+                getDashboardSensor(2);
+                fisWriter.sendString("FUEL", String(fuelLevel) + "L");
+                break;
+            case 5:
+                getECUSensor(5);
+                fisWriter.sendString("ENGINE", String(engineSpeed) + " rpm");
+                break;
+            case 6:
+                getECUSensor(4);
+                fisWriter.sendString("AIR TEMP", String(intakeAirTemp) + "C");
+                break;
+            case 7:
+                getECUSensor(2);
+                fisWriter.sendString("INJ TIME", String(injektTime) + "m/s");
+                break;
+            case 8:
+                getECUSensor(5);
+                fisWriter.sendString("MAF", String(MAF) + "g/s");
+                break;
+        }
+    } 
+	else {
 
-    // Проверка на два нажатия кнопки
-    if (btnUp.hasClicks(2)) // Два нажатия - возврат на предыдущую страницу
-    {
-      currPage--; // Уменьшаем номер текущей страницы
-      if (currPage < 1) // Если текущая страница меньше 1, возврат на последнюю (9-ю)
-        currPage = 8; // Сбрасываем на последнюю страницу
-      eeprom_update_byte(0, currPage);
-    }
+            // Long button press to confirm menu selection
+    btnUp.tick(); // Обновление состояния кнопки
 
-// В зависимости от текущей страницы выполняем разные действия
-    switch (currPage)
-    {
-    case 1:// Страница 1
-	getECUSensor(5); // Получаем данные с ECU для группы 5
-	  fisWriter.sendString("SPEED", String(vehicleSpeed) + " km/h"); // Отправляем скорость движения на экран
-    break;
-
-    case 2:
-	getECUSensor(4);
-      fisWriter.sendString("COOLANT", String(coolantTemp) + "C"); // Отправляем температуру охлаждающей жидкости
-    break;
-	  
-    case 3:
-	getECUSensor(4);
-      fisWriter.sendString("VOLTAGE", String(supplyVoltage) + "V"); // Отправляем напряжение на экран
-    break;
-	
-	case 4:
-    getDashboardSensor(2); // Получаем данные с панели приборов для группы 2
-      fisWriter.sendString("FUEL", String(fuelLevel) + "L"); // Отправляем уровень топлива на экран
-    break;
-	
-    case 5:
-	 getECUSensor(5);
-	  fisWriter.sendString("ENGINE", String(engineSpeed) + " rpm"); // Отправляем скорость двигателя
-    break;
-	
-	case 6:
-	getECUSensor(4);
-      fisWriter.sendString("AIR", String(intakeAirTemp) + "C"); // Отправляем температуру воздуха на впуске
-    break;
-	
-    case 7:
-	getECUSensor(2);
-      fisWriter.sendString("INJ TIME", String(injektTime) + "m/s"); // Отправляем время впрыска
-    break;
-
-    case 8:
-	getECUSensor(5);
-	  fisWriter.sendString("MAF", String(MAF) + "g/s"); // Отправляем данные о массовом расходе воздуха
-    break;
-    }
-  }
-
-    else
-    {
+if (btnUp.held()) { // Проверка удержания кнопки
+    inSubMenu = true; // Установка флага, что мы зашли в подменю
+    switch (currentMenuSelection) {
+		
+            case 0:
+                    {
       {
         getECUSensor(2); // Читаем данные с группы 2
         getECUSensor(4); // Читаем данные с группы 4
@@ -898,21 +924,94 @@ void loop() {
 
       // Инициализация полного экрана для отображения информации
       fisWriter.initFullScreen();
-	  fisWriter.sendStringFS(0, 0, 0x21, "SUMMARY"); // 2,-горизонт по пикселям 1,-вертикаль по пикселям 0x21,стиль текста. ЄКРАН 64*88
-      fisWriter.sendMsgFS(0,10,0x20,10," ECU INFO "); // 8пикселей занимает текст в висоту 
-	  
-	  fisWriter.sendStringFS(2, 30, 0x05, "AIR TEMP");
-      fisWriter.sendStringFS(40, 30, 0x05, " " + String(intakeAirTemp));
-	  fisWriter.sendStringFS(2, 40, 0x05, "COOLANT");
-      fisWriter.sendStringFS(40, 40, 0x05, " " + String(coolantTemp));
-	  fisWriter.sendStringFS(2, 50, 0x05, "FUEL LVL");
-      fisWriter.sendStringFS(40, 50, 0x05, " " + String(fuelLevel));	  
-	  fisWriter.sendStringFS(2, 60, 0x05, "VOLTAGE");
+    fisWriter.sendStringFS(0, 0, 0x21, "SUMMARY");
+	fisWriter.sendMsgFS(0,10,0x24,13,"INFO ECU"); // 8пикселей занимает текст в висоту 
+    // Добавьте код для отображения данных, например:
+      fisWriter.sendStringFS(0, 20, 0x05, "ENGINE");
+	  fisWriter.sendStringFS(40, 20, 0x05, " " + String(engineSpeed));
+      fisWriter.sendStringFS(0, 28, 0x05, "SPEED");
+      fisWriter.sendStringFS(40, 28, 0x05, " " + String(vehicleSpeed));
+	  fisWriter.sendStringFS(0, 36, 0x05, "AIR TEMP");
+      fisWriter.sendStringFS(40, 36, 0x05, " " + String(intakeAirTemp));
+	  fisWriter.sendStringFS(0, 44, 0x05, "COOLANT");
+      fisWriter.sendStringFS(40, 44, 0x05, " " + String(coolantTemp));
+	  fisWriter.sendStringFS(0, 52, 0x05, "FUEL LVL");
+      fisWriter.sendStringFS(40, 52, 0x05, " " + String(fuelLevel));	  
+	  fisWriter.sendStringFS(0, 60, 0x05, "VOLTAGE");
       fisWriter.sendStringFS(40, 60, 0x05, " " + String(supplyVoltage));
-	  fisWriter.sendStringFS(2, 70, 0x05, "INJ TIME");
-      fisWriter.sendStringFS(40, 70, 0x05, " " + String(injektTime));
-	  fisWriter.sendStringFS(2, 80, 0x05, "MAF");
-      fisWriter.sendStringFS(40, 80, 0x05, " " + String(MAF));
+	  fisWriter.sendStringFS(0, 68, 0x05, "INJ TIME");
+      fisWriter.sendStringFS(40, 68, 0x05, " " + String(injektTime));
+	  fisWriter.sendStringFS(0, 76, 0x05, "MAF");
+      fisWriter.sendStringFS(40, 76, 0x05, " " + String(MAF));
+	  fisWriter.sendStringFS(0, 84, 0x05, "RET.");
+      fisWriter.sendStringFS(40, 84, 0x05, " " + String(param0) + ":" + String(param1) + ":" + String(param2) + ":" + String(param3));
     }
+                break;
+            case 1:
+      fisWriter.sendStringFS(0, 0, 0x21, "READ ERROR");
+      fisWriter.sendMsgFS(0,10,0x24,15,"two clicks del"); // 8пикселей занимает текст в висоту 
+    
+	if(!readErrorflag){
+                if (currAddr != ADR_Engine)
+  {
+    connect(ADR_Engine, ADR_Engine_Speed);
+    
+  }
+          readErrors();
+          !readErrorflag;
+        //  disconnect();
+        }
+        if(ErrorArray[errorErrorCount]){
 
+        } else {
+          errorErrorCount = 1;
+        }
+		
+        fisWriter.sendStringFS(0, 30, 0x21, "CODE " + String(ErrorArray[0])); //код
+		fisWriter.sendStringFS(0, 50, 0x21, "amount " + String(ErrorArray[errorErrorCount])); //количество
+        
+		Serial.println(ErrorArray[errorErrorCount]);
+        errorErrorCount++;
+        delay(1000);
+                break;
+            case 2:
+    fisWriter.initFullScreen();
+    fisWriter.sendStringFS(0, 0, 0x21, "ABOUT");
+	
+    fisWriter.sendStringFS(0, 20, 0x05, "UFIS V1");
+	fisWriter.sendStringFS(0, 30, 0x05, "TRIPCOMPUTER");
+	fisWriter.sendStringFS(0, 40, 0x05, "FOR PQ34 PLATFORM");
+	fisWriter.sendStringFS(0, 50, 0x05, "MADE FOR YOURSELF");
+	fisWriter.sendStringFS(0, 60, 0x05, "ON FREE LIBRARIES");
+                break;
+            case 3:
+				fullDash = true; // Возврат к основному экрану
+                break;
+            case 4:
+                //Код для выключения устройства
+
+    // Отключение периферийных устройств на пинах 1 и 2
+    pinMode(4, OUTPUT);
+    pinMode(3, OUTPUT);
+    digitalWrite(4, LOW); // Отключить периферийное устройство на пине 1
+    digitalWrite(3, LOW); // Отключить периферийное устройство на пине 2
+
+    // Настройка и переход в режим сна
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    sleep_enable();
+    
+    // Отключение ненужных периферийных устройств контроллера
+    power_adc_disable();
+    power_spi_disable();
+    power_timer0_disable();
+    power_timer1_disable();
+    power_twi_disable();
+    
+    sleep_mode(); // Переход в спящий режим (устройство засыпает и ждет пробуждения)
+
+    sleep_disable(); // Код сюда не дойдет, так как контроллер проснется по внешнему событию
+                break;
+        }
+	  }
+    }
   }
